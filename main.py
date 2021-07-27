@@ -70,7 +70,7 @@ from sklearn.pipeline import Pipeline
 
 feat_med = ["R_age", "B_age"]
 feat_freq = ["R_Stance", "B_Stance"]
-feat_mult = ["R_Weight_lbs", "R_Height_cms", "B_Height_cms",
+feat_mult = ["R_Height_cms", "B_Height_cms",
              "R_Reach_cms", "B_Reach_cms"]
 
 med_transformer = \
