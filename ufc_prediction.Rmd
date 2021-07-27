@@ -1,0 +1,247 @@
+---
+title: "ufc_prediction"
+author: "Chris Oh"
+date: '2021 5 20'
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Libraries
+
+```{r, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(xgboost)
+library(tidymodels)
+library(vip)
+```
+
+```{r, include=FALSE}
+# path_files <- "C:/users/logic/Downloads/ufc_predict/data/"
+```
+
+## Import and cleaning
+
+```{r}
+fights <- read_csv(str_c("./data/data.csv"))
+```
+
+Let's check for NA's.
+
+```{r}
+fights %>% 
+  summarize(across(everything(), ~sum(is.na(.))/n()))
+```
+
+Fights where the fight stats are missing should be excluded.
+
+```{r}
+fights_processed <-
+  fights %>% 
+  drop_na(B_avg_KD, R_avg_KD)
+
+```
+
+The Unified Rules of MMA has been in effect after April 2001 - before, the rules of the fights
+varied significantly to what they are now.
+
+Hence, we exclude the older fights from our analysis.
+
+We also remove all the variables that should not be relevant to the prediction.
+
+Let's also exclude fights that ended in draws, as well as the variable that 
+records each fighter's number of draws (mostly 0).
+
+```{r}
+fights_processed <-
+  fights_processed %>% 
+  filter(date > ymd("2001-04-01")) %>% 
+  select(
+    -Referee,
+    -location,
+     # We have a better measure called fighter weight that is a continuous version
+    # weightclass variable
+    -weight_class
+  ) %>% 
+  filter(Winner %in% c("Red", "Blue")) %>% 
+  select(-R_draw, -B_draw, -R_fighter, -B_fighter, -date) %>% 
+  mutate(Winner = as.factor(Winner))
+```
+
+
+## Modelling with XGBoost
+
+XGBoost has proven to be highly effective with structured data while requiring
+minimal data pre-processing.
+
+Let's define the last of the preprocessing steps so as to prevent data leakage.
+
+```{r}
+set.seed(123)
+fights_split <- initial_split(fights_processed, strata = Winner)
+fights_train <- training(fights_split)
+fights_test <- testing(fights_split)
+
+xgb_rec <- 
+  recipe(Winner ~ ., data = fights_train) %>%
+  # median imputation for ages
+  step_impute_median(R_age, B_age) %>%
+  # mode (most common values) imputation for stances
+  step_impute_mode(R_Stance, B_Stance) %>% 
+  # impute height and reach stats
+  step_impute_bag(R_Height_cms, B_Height_cms, R_Reach_cms, B_Reach_cms) %>% 
+  # One hot encode categorical features
+  step_dummy(all_nominal_predictors())
+```
+
+Hyperparameter tuning
+
+```{r}
+xgb_spec <-
+  boost_tree(
+    mode = "classification",
+    engine = "xgboost",
+    mtry = tune(),
+    trees = 500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    sample_size = tune()
+  )
+
+xgb_flow <-
+  workflow() %>% 
+  add_recipe(xgb_rec) %>% 
+  add_model(xgb_spec)
+
+#Latin cube to fill in the grid with evenly spaced points
+xgb_grid<-
+  grid_latin_hypercube(
+    finalize(mtry(), fights_train),
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction(),
+    sample_size = sample_prop(),
+    size = 80
+  )
+```
+
+Conduct CV for hyperparameter tuning
+
+```{r}
+set.seed(123)
+fights_cv <- vfold_cv(fights_train, v = 5, strata = Winner)
+```
+
+
+```{r, eval=FALSE}
+doParallel::registerDoParallel()
+
+set.seed(123)
+xgb_tune <-
+  tune_grid(
+    xgb_flow,
+    resamples = fights_cv,
+    grid = xgb_grid,
+    control = control_grid(save_pred = TRUE)
+  )
+```
+
+
+```{r, include=FALSE}
+# xgb_tune %>%
+#   write_rds("xgb_tune.rds")
+
+xgb_tune <- read_rds("./data/xgb_tune.rds")
+```
+
+#### view CV results
+
+```{r}
+xgb_tune %>% 
+  collect_metrics() %>% 
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+
+```{r}
+show_best(xgb_tune)
+```
+
+Select the best performing specification
+
+```{r}
+xgb_best <- select_best(xgb_tune, "roc_auc")
+xgb_fin <- 
+  finalize_workflow(
+    xgb_flow,
+    xgb_best
+  )
+
+xgb_fin
+```
+
+Variable importance plot
+
+```{r, warning=FALSE, message=FALSE}
+xgb_fin %>%
+  fit(data = fights_train) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+
+Model evaluation
+
+```{r}
+xgb_final_fit <-
+  last_fit(xgb_fin, fights_split)
+collect_metrics(xgb_final_fit)
+```
+
+ROC Plot
+
+```{r}
+xgb_final_fit %>%
+  collect_predictions() %>%
+  roc_curve(Winner, .pred_Blue) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(size = 1.5, color = "midnightblue") +
+  geom_abline(
+    lty = 2, alpha = 0.5,
+    color = "gray50",
+    size = 1.2
+  )
+```
+
+Confusion Matrix
+
+```{r}
+xgb_final_fit %>% 
+  collect_predictions() %>% 
+  conf_mat(truth = Winner, estimate = .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+## Final Thoughts
+
+XGBoost is shown to do a relatively good job of predicting a majority class (Red corner winning),
+but not so much for the minority class (Blue corner winning).
+
+Besides the bragging rights for a correct prediction, people often bet on fights
+based on the odds. To optimize a betting strategy ie maximizing the expected profits,
+we would need to augment the data with odds data for each fight and incorporate
+the odds to the loss function.
